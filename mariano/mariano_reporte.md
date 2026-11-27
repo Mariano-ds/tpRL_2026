@@ -1,15 +1,97 @@
-# Decision Transformer e IQL para recomendaciones — Reporte del TP
+# Sistema de recomendación de películas Netflix con algoritmos DT e IQL en Torch
 
 Diplomatura en Ciencia de Datos 2026 · Optativa Aprendizaje por Refuerzo
-Autor: Gonzalo Perez Paina · Dataset: **Netflix** (752 ítems, 8 grupos)
 
-> **Nota de edición.** Este borrador se armó a partir de tres fuentes:
-> - las exportaciones de los notebooks `gonzalo_1_exploracion.md` (exploración) y `gonzalo_3_claude_agent.md` (entrenamiento y evaluación);
-> - el código de `modelos/dt.py` y `modelos/iql.py`.
->
-> Los datos que dependen de archivos no disponibles (`modelos/entrenar.py`, `modelos/comun.py` y las figuras) quedan marcados como **[COMPLETAR]**. Lo que se infiere sin confirmación queda como **[VERIFICAR]**.
+BAGGINI, Mariano; LESCANO, Juliana; PEREZ, Gonzalo 
 
 ---
+
+## RESUMEN
+
+## I. INTRODUCCIÓN
+TODO - Presente brevemente el problema y el objetivo del trabajo. Explique, en pocos párrafos, por qué estos algoritmos pueden utilizarse para construir un sistema de recomendación con RL. Incluya citas bibliográficas pertinentes. La introducción debe aportar contexto; no se espera una revisión teórica extensa de aprendizaje profundo.
+
+## II. MARCO TEÓRICO
+
+### Dataset
+
+Para abordar el trabajo se utilizó el conjunto de datos sintéticos de Netflix con 8 grupos, con su respectiva partición de entrenamiento, subdividida en train y val, y test. Cada entrada del dataset de entrenamiento original representa un único usuario identificable con su id, asociado a un grupo específico. Se da la cantidad de ítems valorados, es decir de películas calificadas, la lista con el identificador de los ítems y una lista con las valoraciones asociadas. Cada usuario valora una cantidad distinta de películas distintas. 16.000 usuarios sintéticos (2.000 por grupo) y 752 películas, de los cuales 14.600 se usan en train y 1.600 en val.
+
+Usando esta estructura inicial se pasa a una tabla en formato largo, en la que cada interacción es una entrada. Aquí cada fila tiene asociada una única película y calificación. Esta tabla tiene 1615959 entradas y 5 columnas, y es la que se usará para el resto del trabajo.
+
+Por otro lado, hay `1600` usuarios en el conjunto de `test` con un rating para cada ítem del catálogo, guardados en el orden de los IDs. Los identificadores de estos usuarios no guardan relación alguna con los usuarios del dataset train o val. También se pasó esta tabla a formato largo, para discriminar cada interacción. 
+
+Cabe destacar dos puntos importantes sobre los conjuntos de datos: 
+
+1. Dos usuarios del **mismo grupo** tienen los **mismos gustos** esperados. 
+2. El **rating** de un ítem **no depende de qué otros ítems vio antes** el usuario.
+
+### Planteo del problema como MDP
+
+Un **MDP** (_Markov Decision Process_) es un marco matemático que modela la toma de decisiones secuencial mediante estados, acciones, recompensas y transiciones. En el aprendizaje por refuerzo, esta estructura formal define el entorno y orienta la forma en que se evalúan las decisiones a lo largo del tiempo, permitiendo que los algoritmos aprendan políticas óptimas que maximicen las recompensas a largo plazo.
+
+En el contexto de este problema de recomendación, los elementos habituales de la formulación adoptan significados concretos. Cada `episodio` corresponde a una sesión compuesta por 20 recomendaciones realizadas a un usuario, mientras que el `retorno` se define como la suma acumulada de las calificaciones (ratings) obtenidas a lo largo de dicha sesión. Para guiar estas elecciones, el agente utiliza una `política π`, que actúa como la regla encargada de decidir qué ítem mostrar en función de lo observado hasta el momento. Dado que el problema se aborda bajo un esquema de **RL offline** —es decir, aprendiendo únicamente a partir de registros históricos sin la posibilidad de interactuar ni probar recomendaciones nuevas con los usuarios en tiempo real—, el entrenamiento depende directamente de los datos generados previamente por una política de registro (o de comportamiento), responsable de producir los logs de entrenamiento.
+
+La formulación matemática específica del contexto es la siguiente: 
+
+| Elemento | Significado en contexto |
+|---|---|
+| Estado s_t | lo observado hasta t: grupo (si es visible), ítems mostrados y ratings revelados, y el paso t |
+| Acción a_t | el ítem que se muestra, entre los que todavía no se mostraron |
+| Recompensa r_t | el rating que el usuario le da al ítem mostrado |
+| Transición | se agrega (a_t, r_t) al historial |
+| Horizonte | 20 pasos; el último es terminal |
+| Descuento γ | a elegir; el retorno evaluado es la suma sin descontar |
+
+### Protocolo de evaluación
+
+Para garantizar una comparación justa y reproducible entre enfoques modelos de RL offline y líneas base, los experimentos emplean un protocolo común de simulación controlada. Este entorno evalúa cada política mediante sesiones secuenciales de 20 pasos sin repetición (H = 20), donde el agente puntúa los ítems disponibles y recibe como recompensa la valoración real oculta del ítem elegido. Su aplicación se rige por tres pautas clave:
+
+1. **Escenarios de evaluación:** Se miden tres condiciones: grupo visible sin historial (warmup = 0, personalización por segmento), grupo oculto sin historial (cold-start estricto) y con un historial inicial aleatorio de 5 ítems (warmup = 5), contabilizando métricas solo en los pasos decididos por el agente.
+
+2. **Partición y sesgos:** Los usuarios de entrenamiento se dividen en `90 %` para ajuste y `10 %` para validación (donde se seleccionan hiperparámetros), reservando test para una única evaluación final. Además, se evalúa la robustez tanto sobre registros uniformes como sobre logs sesgados de un sistema anterior (mixto y experto).
+
+3. **Métricas y referencias:** Se prioriza el `retorno normalizado` (escalado entre 0 para una política aleatoria y 1 para el oráculo), complementado con `hit_rate` (valoración mayor o igual a 4) y métricas de ranking (`ndcg@10`, `precision@10`).
+
+Se utilizan las siguientes líneas base para la evaluación de modelos:
+
+| Línea base | Qué hace | Por qué se incluye |
+|---|---|---|
+| `random` | elige al azar; es la política de registro | define el 0 del normalizado |
+| `popularity` | ordena por frecuencia en los logs | mide si alcanza con imitar lo que más se mostró |
+| `item_mean` | ordena por rating medio del ítem | el mejor ranking igual para todos |
+| `group_mean` | rating medio en el grupo, si es visible | personalización por segmento |
+| `group_posterior` | infiere el grupo con los ratings observados | adaptación explícita durante la sesión |
+| `sistema_anterior_eps0` | solo con logs `mixto`: el sistema que generó los logs, sin exploración | referencia de la política de registro |
+
+### Decision Transformer (DT)
+
+El _Decision Transformer_ (DT; Chen et al., 2021) reformula el aprendizaje por refuerzo offline como un problema de modelado de secuencias supervisado, prescindiendo de funciones de valor, bootstrapping o maximización sobre acciones. En lugar de estimar valores futuros, modela cada episodio como una secuencia causal de tripletas (`R̂_t, s_t, a_t`) —retorno acumulado restante, estado observado y acción ejecutada— entrenada mediante atención causal para predecir el ítem `a_t` directamente desde la salida del token `s_t` (sin acceso a `a_t` ni a la recompensa futura `r_t`, evitando fugas de información). Para estructurar esta entrada, combina proyecciones lineales para `R̂_t`, tablas de embeddings para los ítems, codificaciones de paso temporal `t` y tipo de token, además de enmascarar con `-∞` los logits de los ítems ya mostrados en `a_0 ... a_{t-1}` para impedir repeticiones.
+
+Su importancia radica en que permite entrenar un recomendador directamente sobre registros históricos estáticos y modular su desempeño en inferencia: al condicionar al modelo con un retorno objetivo elevado, este imita los patrones de las trayectorias más exitosas presentes en los datos para maximizar la satisfacción del usuario sin necesidad de exploración en línea.
+
+### Implicit Q-Learning (IQL)
+
+## III. METODOLOGÍA
+
+## IV. RESULTADOS Y DISCUSIÓN
+
+## V. CONCLUSIONES
+
+## REFERENCIAS
+
+
+
+
+
+
+
+
+
+
+
+
+# VERSION DE GONZA:
 
 ## 0. Resumen
 
